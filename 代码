@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+方向B：园区微电网风光储协调优化配置
+图表生成脚本 - 生成report中所有7张图表和4张表格
+"""
+import os
+import sys
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+plt.rcParams["font.sans-serif"] = ["WenQuanYi Zen Hei", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+# ============================================================
+# 路径设置（智能适配多种运行环境，支持D盘数据文件）
+# ============================================================
+try:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    SCRIPT_DIR = os.getcwd()
+
+ROOT_DIR = SCRIPT_DIR
+DATA_DIR = os.path.join(ROOT_DIR, "data")
+FIGURES_DIR = os.path.join(ROOT_DIR, "figures")
+
+# 如果data目录不存在，尝试在当前目录查找文件
+if not os.path.exists(DATA_DIR):
+    DATA_DIR = ROOT_DIR
+
+os.makedirs(FIGURES_DIR, exist_ok=True)
+
+def find_data_file(keywords):
+    """在多个目录中模糊查找文件（支持D盘、当前目录、data子目录等）"""
+    # 搜索目录优先级列表（按优先级从高到低）
+    search_dirs = []
+    
+    # 1. 优先搜索data子目录
+    if os.path.exists(DATA_DIR):
+        search_dirs.append(DATA_DIR)
+    
+    # 2. 搜索脚本同级目录
+    search_dirs.append(ROOT_DIR)
+    
+    # 3. 搜索D盘根目录（用户文件放在D盘的情况）
+    if os.path.exists("D:\\"):
+        search_dirs.append("D:\\")
+    
+    # 4. 搜索D:\data\目录
+    if os.path.exists("D:\\data"):
+        search_dirs.append("D:\\data")
+    
+    # 5. 搜索D:\项目文件夹\（常见命名）
+    for folder_name in ["项目", "作业", "课程", "data", "数据"]:
+        folder_path = f"D:\\{folder_name}"
+        if os.path.exists(folder_path):
+            search_dirs.append(folder_path)
+    
+    # 去重（保持顺序）
+    seen = set()
+    unique_dirs = []
+    for d in search_dirs:
+        if d not in seen:
+            seen.add(d)
+            unique_dirs.append(d)
+    search_dirs = unique_dirs
+    
+    print(f"[路径调试] 将在以下目录搜索文件: {search_dirs}")
+    
+    for directory in search_dirs:
+        if not os.path.exists(directory):
+            continue
+        # 打印目录内容用于调试（仅第一次）
+        try:
+            files_in_dir = os.listdir(directory)
+            print(f"  [调试] {directory} 中的文件: {files_in_dir[:20]}")
+        except:
+            pass
+        
+        for file in os.listdir(directory):
+            # 去除末尾的_1等编号后缀进行匹配
+            base_name = file.replace("_1.xlsx", ".xlsx").replace("_1.xls", ".xls")
+            if keywords in base_name or keywords in file:
+                found_path = os.path.join(directory, file)
+                print(f"  [成功] 找到文件: {found_path}")
+                return found_path
+    return None
+
+# 自动匹配真实文件名
+path_load = find_data_file("各园区典型日负荷数据")
+path_ws = find_data_file("各园区典型日风光发电数据")
+path_ws12 = find_data_file("12个月各园区典型日风光发电")
+
+if path_load is None:
+    raise FileNotFoundError("未找到负荷数据文件！请检查：1) 文件是否在D盘或当前目录中 2) 文件名是否包含'各园区典型日负荷数据' 3) 文件扩展名是否为.xlsx。当前搜索目录: {dirs}".format(dirs=search_dirs))
+if path_ws is None:
+    raise FileNotFoundError("未找到风光发电数据文件！请检查：1) 文件是否在D盘或当前目录中 2) 文件名是否包含'各园区典型日风光发电数据' 3) 文件扩展名是否为.xlsx。当前搜索目录: {dirs}".format(dirs=search_dirs))
+
+print(f"[路径] 负荷文件: {path_load}")
+print(f"[路径] 风光文件: {path_ws}")
+if path_ws12:
+    print(f"[路径] 12月风光文件: {path_ws12}")
+
+# ============================================================
+# 参数定义
+# ============================================================
+PARKS = {
+    "A": {"wind_cap": 0, "solar_cap": 750, "max_load": 447},
+    "B": {"wind_cap": 1000, "solar_cap": 0, "max_load": 419},
+    "C": {"wind_cap": 500, "solar_cap": 600, "max_load": 506},
+}
+
+GRID_PRICE = 1.0
+WIND_PRICE = 0.5
+SOLAR_PRICE = 0.4
+STORAGE_POWER_PRICE = 800
+STORAGE_CAP_PRICE = 1800
+CHARGE_EFF = 0.95
+DISCHARGE_EFF = 0.95
+SOC_MIN = 0.10
+SOC_MAX = 0.90
+STORAGE_LIFESPAN = 10
+
+# ============================================================
+# 数据读取函数
+# ============================================================
+def read_load_data(filepath):
+    """读取附件1：各园区典型日负荷数据"""
+    df = pd.read_excel(filepath)
+    # 第一行是表头，数据从第二行开始
+    # iloc[:, 1] -> 第2列(园区A负荷), iloc[:, 2] -> 第3列(园区B负荷), iloc[:, 3] -> 第4列(园区C负荷)
+    load_A = df.iloc[:, 1].values.astype(float)
+    load_B = df.iloc[:, 2].values.astype(float)
+    load_C = df.iloc[:, 3].values.astype(float)
+    return load_A, load_B, load_C
+
+def read_wind_solar_data(filepath):
+    """读取附件2：各园区典型日风光发电数据（标幺值）
+    
+    文件结构：
+    Row 0: 说明行（文本）
+    Row 1: 表头行1（时间 | 园区A光伏 | 园区B风电 | 园区C | NaN）
+    Row 2: 表头行2（NaN | NaN | NaN | 光伏出力 | 风电出力）
+    Row 3-26: 数据行（24小时）
+    
+    列映射：col1=园区A光伏(p.u.), col2=园区B风电(p.u.), col3=园区C光伏(p.u.), col4=园区C风电(p.u.)
+    """
+    df = pd.read_excel(filepath, header=None)
+    data_rows = []
+    # 从第3行开始读取数据（跳过说明行和两行表头）
+    for i in range(3, len(df)):
+        val = df.iloc[i, 0]
+        if pd.notna(val) and str(val).strip():
+            # 提取列1-4的值并转换为float
+            row_vals = df.iloc[i, 1:5]
+            try:
+                row_float = row_vals.astype(float)
+                data_rows.append(row_float.values)
+            except (ValueError, TypeError):
+                continue
+    data = np.array(data_rows)
+    return data
+
+def pu_to_actual(solar_pu, wind_pu, park_id):
+    """将标幺值转换为实际功率(kW)"""
+    park = PARKS[park_id]
+    solar_actual = solar_pu * park["solar_cap"] if park["solar_cap"] > 0 else np.zeros_like(solar_pu)
+    wind_actual = wind_pu * park["wind_cap"] if park["wind_cap"] > 0 else np.zeros_like(solar_pu)
+    return solar_actual, wind_actual
+
+# ============================================================
+# 无储能基线计算
+# ============================================================
+def calc_baseline(load, solar, wind):
+    """计算无储能基线指标"""
+    solar_used = np.minimum(solar, load)
+    remaining = load - solar_used
+    wind_used = np.minimum(wind, remaining)
+    grid_buy = np.maximum(0, remaining - wind_used)
+    curtail_solar = np.maximum(0, solar - solar_used)
+    curtail_wind = np.maximum(0, wind - wind_used)
+    curtail = curtail_solar + curtail_wind
+
+    total_buy = np.sum(grid_buy)
+    total_curtail = np.sum(curtail)
+    total_solar_used = np.sum(solar_used)
+    total_wind_used = np.sum(wind_used)
+    total_cost = total_buy * GRID_PRICE + total_solar_used * SOLAR_PRICE + total_wind_used * WIND_PRICE
+    total_supply = np.sum(load)
+    unit_cost = total_cost / total_supply if total_supply > 0 else 0
+
+    return {
+        "buy_energy": total_buy, "curtail_energy": total_curtail,
+        "solar_used": total_solar_used, "wind_used": total_wind_used,
+        "total_cost": total_cost, "unit_cost": unit_cost, "total_supply": total_supply,
+        "grid_buy": grid_buy, "curtail": curtail,
+        "solar_used_h": solar_used, "wind_used_h": wind_used,
+    }
+
+# ============================================================
+# 储能运行模拟
+# ============================================================
+def simulate_storage(load, solar, wind, P_stor, C_stor):
+    """储能运行模拟：富余绿电充电，供电不足时放电"""
+    total_gen = solar + wind
+    soc = C_stor * 0.5  # 初始电量(kWh)
+
+    charge_p = np.zeros(24)
+    discharge_p = np.zeros(24)
+    grid_buy = np.zeros(24)
+    curtail = np.zeros(24)
+    soc_trace = [soc]
+
+    for t in range(24):
+        surplus = total_gen[t] - load[t]
+
+        if surplus > 0:
+            # 有富余绿电：优先给储能充电
+            max_charge_p = P_stor
+            max_charge_e = (SOC_MAX * C_stor - soc) / CHARGE_EFF
+            actual_charge_e = min(surplus, max_charge_p, max_charge_e)
+            actual_charge_e = max(actual_charge_e, 0)
+            charge_p[t] = actual_charge_e
+            soc += actual_charge_e * CHARGE_EFF
+            remaining = surplus - actual_charge_e
+            curtail[t] = max(remaining, 0)
+            grid_buy[t] = 0
+        else:
+            # 供电不足：储能放电 + 电网补充
+            deficit = -surplus
+            max_discharge_p = P_stor
+            max_discharge_e = (soc - SOC_MIN * C_stor) * DISCHARGE_EFF
+            actual_discharge_e = min(deficit, max_discharge_p, max_discharge_e)
+            actual_discharge_e = max(actual_discharge_e, 0)
+            discharge_p[t] = actual_discharge_e
+            soc -= actual_discharge_e / DISCHARGE_EFF
+            grid_buy[t] = max(0, deficit - actual_discharge_e)
+
+        soc = np.clip(soc, SOC_MIN * C_stor, SOC_MAX * C_stor)
+        soc_trace.append(soc)
+
+    # 计算弃电（能量守恒）
+    curtail_final = np.zeros(24)
+    for t in range(24):
+        curtail_final[t] = total_gen[t] + discharge_p[t] + grid_buy[t] - load[t] - charge_p[t]
+        curtail_final[t] = max(curtail_final[t], 0)
+
+    # 消纳计算
+    solar_used_h = np.minimum(solar, load)
+    remaining_after_solar = load - solar_used_h
+    wind_used_h = np.minimum(wind, remaining_after_solar)
+
+    total_buy = np.sum(grid_buy)
+    total_curtail = np.sum(curtail_final)
+    total_solar_used = np.sum(solar_used_h)
+    total_wind_used = np.sum(wind_used_h)
+    total_cost = total_buy * GRID_PRICE + total_solar_used * SOLAR_PRICE + total_wind_used * WIND_PRICE
+    total_supply = np.sum(load)
+    unit_cost = total_cost / total_supply if total_supply > 0 else 0
+
+    return {
+        "buy_energy": total_buy, "curtail_energy": total_curtail,
+        "solar_used": total_solar_used, "wind_used": total_wind_used,
+        "total_cost": total_cost, "unit_cost": unit_cost, "total_supply": total_supply,
+        "grid_buy": grid_buy, "curtail": curtail_final,
+        "solar_used_h": solar_used_h, "wind_used_h": wind_used_h,
+        "discharge_p": discharge_p, "charge_p": charge_p,
+        "soc_trace": soc_trace,
+    }
+
+# ============================================================
+# 储能容量优化（网格搜索）
+# ============================================================
+def optimize_storage_capacity(load, solar, wind):
+    """以全寿命周期成本最低为目标优化储能功率与容量"""
+    best_cost = float("inf")
+    best_config = None
+    scan_results = []
+
+    P_range = [10, 20, 30, 40, 50, 60, 80, 100]
+    C_range = [20, 40, 60, 80, 100, 120, 150, 200, 250, 300]
+
+    for P in P_range:
+        for C in C_range:
+            if C < P * 2:
+                continue
+            res = simulate_storage(load, solar, wind, P, C)
+            storage_cap_cost = C * STORAGE_CAP_PRICE
+            storage_pow_cost = P * STORAGE_POWER_PRICE
+            annual_investment = (storage_cap_cost + storage_pow_cost) / STORAGE_LIFESPAN
+            annual_total = res["total_cost"] * 365 + annual_investment
+
+            scan_results.append({
+                "P": P, "C": C,
+                "annual_total": annual_total,
+                "daily_cost": res["total_cost"],
+                "annual_investment": annual_investment,
+            })
+
+            if annual_total < best_cost:
+                best_cost = annual_total
+                best_config = {"P": P, "C": C}
+
+    return best_config, scan_results
+
+# ============================================================
+# 联合运营分析
+# ============================================================
+def joint_operation_analysis(load_A, load_B, load_C, solar_A, solar_B, solar_C, wind_A, wind_B, wind_C):
+    """三个园区联合运营 vs 独立运营经济性对比"""
+    # 独立运营无储能基线
+    bl_A = calc_baseline(load_A, solar_A, wind_A)
+    bl_B = calc_baseline(load_B, solar_B, wind_B)
+    bl_C = calc_baseline(load_C, solar_C, wind_C)
+    indep_bl_cost = bl_A["total_cost"] + bl_B["total_cost"] + bl_C["total_cost"]
+
+    # 独立运营+储能
+    stor_A = simulate_storage(load_A, solar_A, wind_A, 50, 100)
+    stor_B = simulate_storage(load_B, solar_B, wind_B, 50, 100)
+    stor_C = simulate_storage(load_C, solar_C, wind_C, 50, 100)
+    indep_stor_cost = stor_A["total_cost"] + stor_B["total_cost"] + stor_C["total_cost"]
+
+    # 联合运营（负荷和发电汇总）
+    joint_load = load_A + load_B + load_C
+    joint_solar = solar_A + solar_B + solar_C
+    joint_wind = wind_A + wind_B + wind_C
+
+    joint_bl = calc_baseline(joint_load, joint_solar, joint_wind)
+    # 联合运营+储能（总功率和容量为三园区之和）
+    joint_stor = simulate_storage(joint_load, joint_solar, joint_wind, 150, 300)
+
+    saving = indep_stor_cost - joint_stor["total_cost"]
+    saving_rate = saving / indep_stor_cost * 100 if indep_stor_cost > 0 else 0
+
+    return {
+        "baseline": {"A": bl_A, "B": bl_B, "C": bl_C},
+        "storage": {"A": stor_A, "B": stor_B, "C": stor_C},
+        "joint_bl": joint_bl,
+        "joint_stor": joint_stor,
+        "indep_bl_cost": indep_bl_cost,
+        "indep_stor_cost": indep_stor_cost,
+        "joint_stor_cost": joint_stor["total_cost"],
+        "saving": saving,
+        "saving_rate": saving_rate,
+    }
+
+# ============================================================
+# 读取数据并执行计算
+# ============================================================
+print("=" * 60)
+print("园区微电网风光储协调优化配置 - 完整分析脚本")
+print("=" * 60)
+
+print("\n[1] 读取数据...")
+load_A, load_B, load_C = read_load_data(path_load)
+
+ws_data = read_wind_solar_data(path_ws)
+# ws_data列顺序: solar_A, wind_B, solar_C, wind_C
+solar_A_pu = ws_data[:, 0]
+wind_B_pu = ws_data[:, 1]
+solar_C_pu = ws_data[:, 2]
+wind_C_pu = ws_data[:, 3]
+
+# 转换为实际功率(kW)
+solar_A, wind_A = pu_to_actual(solar_A_pu, wind_B_pu, "A")
+solar_B, wind_B = pu_to_actual(np.zeros_like(solar_A_pu), wind_B_pu, "B")
+solar_C, wind_C = pu_to_actual(solar_C_pu, wind_C_pu, "C")
+
+print(f"  园区A: 负荷={load_A.sum():.1f}kWh, 光伏={solar_A.sum():.1f}kWh, 风电={wind_A.sum():.1f}kWh")
+print(f"  园区B: 负荷={load_B.sum():.1f}kWh, 光伏={solar_B.sum():.1f}kWh, 风电={wind_B.sum():.1f}kWh")
+print(f"  园区C: 负荷={load_C.sum():.1f}kWh, 光伏={solar_C.sum():.1f}kWh, 风电={wind_C.sum():.1f}kWh")
+
+print("\n[2] 计算无储能基线...")
+baseline_A = calc_baseline(load_A, solar_A, wind_A)
+baseline_B = calc_baseline(load_B, solar_B, wind_B)
+baseline_C = calc_baseline(load_C, solar_C, wind_C)
+
+print("\n[3] 模拟储能运行(50kW/100kWh)...")
+storage_A = simulate_storage(load_A, solar_A, wind_A, 50, 100)
+storage_B = simulate_storage(load_B, solar_B, wind_B, 50, 100)
+storage_C = simulate_storage(load_C, solar_C, wind_C, 50, 100)
+
+print("\n[4] 联合运营分析...")
+joint = joint_operation_analysis(load_A, load_B, load_C, solar_A, solar_B, solar_C, wind_A, wind_B, wind_C)
+
+print("\n[5] 预计算容量优化...")
+scan_A = optimize_storage_capacity(load_A, solar_A, wind_A)[1]
+scan_B = optimize_storage_capacity(load_B, solar_B, wind_B)[1]
+scan_C = optimize_storage_capacity(load_C, solar_C, wind_C)[1]
+
+hours = list(range(24))
+
+# ============================================================
+# 图一：三个园区负荷曲线
+# ============================================================
+print("\n" + "=" * 60)
+print("开始生成图表...")
+print("[1/7] 生成图一：三个园区负荷曲线...")
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(hours, load_A, 'o-', color='#4E79A7', label='园区A', linewidth=2, markersize=5)
+ax.plot(hours, load_B, 's-', color='#F28E2B', label='园区B', linewidth=2, markersize=5)
+ax.plot(hours, load_C, '^-', color='#59A14F', label='园区C', linewidth=2, markersize=5)
+ax.set_xlabel('时刻 (h)', fontsize=11)
+ax.set_ylabel('负荷 (kW)', fontsize=11)
+ax.set_title('三个园区典型日负荷曲线', fontsize=13, fontweight='bold')
+ax.legend(fontsize=10)
+ax.grid(True, alpha=0.3)
+fig.savefig(os.path.join(FIGURES_DIR, "fig1_load_curves.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图一已保存")
+
+# ============================================================
+# 图二：各园区典型日风光出力曲线
+# ============================================================
+print("[2/7] 生成图二：各园区典型日风光出力曲线...")
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(hours, solar_A, 'o-', color='#EDC948', label='园区A光伏', linewidth=2, markersize=5)
+ax.plot(hours, wind_A * 0 + 0, 'o-', color='#4E79A7', label='园区A风电', linewidth=2, markersize=5)
+ax.plot(hours, solar_B * 0 + 0, 's-', color='#F28E2B', label='园区B光伏', linewidth=2, markersize=5)
+ax.plot(hours, wind_B, 's-', color='#76B7B2', label='园区B风电', linewidth=2, markersize=5)
+ax.plot(hours, solar_C, '^-', color='#EDC948', linestyle='--', label='园区C光伏', linewidth=2, markersize=5)
+ax.plot(hours, wind_C, '^-', color='#B07AA1', label='园区C风电', linewidth=2, markersize=5)
+ax.set_xlabel('时刻 (h)', fontsize=11)
+ax.set_ylabel('出力 (kW)', fontsize=11)
+ax.set_title('各园区典型日风光出力曲线', fontsize=13, fontweight='bold')
+ax.legend(fontsize=9, loc='upper right')
+ax.grid(True, alpha=0.3)
+fig.savefig(os.path.join(FIGURES_DIR, "fig2_wind_solar_output.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图二已保存")
+
+# ============================================================
+# 图三：各园区典型日净负荷曲线
+# ============================================================
+print("[3/7] 生成图三：各园区典型日净负荷曲线...")
+
+net_load_A = load_A - solar_A - wind_A
+net_load_B = load_B - solar_B - wind_B
+net_load_C = load_C - solar_C - wind_C
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(hours, net_load_A, 'o-', color='#4E79A7', label='园区A', linewidth=2, markersize=5)
+ax.plot(hours, net_load_B, 's-', color='#F28E2B', label='园区B', linewidth=2, markersize=5)
+ax.plot(hours, net_load_C, '^-', color='#59A14F', label='园区C', linewidth=2, markersize=5)
+ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+ax.fill_between(hours, 0, net_load_A, where=[x > 0 for x in net_load_A], alpha=0.1, color='#4E79A7')
+ax.fill_between(hours, 0, net_load_B, where=[x > 0 for x in net_load_B], alpha=0.1, color='#F28E2B')
+ax.fill_between(hours, 0, net_load_C, where=[x > 0 for x in net_load_C], alpha=0.1, color='#59A14F')
+ax.set_xlabel('时刻 (h)', fontsize=11)
+ax.set_ylabel('净负荷 (kW)', fontsize=11)
+ax.set_title('各园区典型日净负荷曲线', fontsize=13, fontweight='bold')
+ax.legend(fontsize=10)
+ax.grid(True, alpha=0.3)
+fig.savefig(os.path.join(FIGURES_DIR, "fig3_net_load.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图三已保存")
+
+# ============================================================
+# 图四：各园区储能SOC变化曲线
+# ============================================================
+print("[4/7] 生成图四：各园区储能SOC变化曲线...")
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+colors_map = {'A': '#4E79A7', 'B': '#F28E2B', 'C': '#59A14F'}
+parks_list = [
+    ("A", storage_A, load_A, solar_A, wind_A),
+    ("B", storage_B, load_B, solar_B, wind_B),
+    ("C", storage_C, load_C, solar_C, wind_C),
+]
+for idx, (park_id, stor, ld, sl, wn) in enumerate(parks_list):
+    ax = axes[idx]
+    soc_values = stor['soc_trace']
+    hours_full = list(range(25))
+    ax.plot(hours_full, soc_values, 'o-', color=colors_map[park_id], linewidth=2, markersize=5, label='SOC')
+    ax.axhline(y=SOC_MAX, color='red', linestyle='--', alpha=0.5, label=f'SOC上限({SOC_MAX})')
+    ax.axhline(y=SOC_MIN, color='green', linestyle='--', alpha=0.5, label=f'SOC下限({SOC_MIN})')
+    charge_hours = [t for t in range(24) if stor['charge_p'][t] > 0]
+    discharge_hours = [t for t in range(24) if stor['discharge_p'][t] > 0]
+    if charge_hours:
+        charge_soc = [stor['soc_trace'][t+1] for t in charge_hours]
+        ax.scatter(charge_hours, charge_soc, color='blue', marker='^', s=60, zorder=5, label='充电时刻', edgecolors='white', linewidth=0.5)
+    if discharge_hours:
+        discharge_soc = [stor['soc_trace'][t+1] for t in discharge_hours]
+        ax.scatter(discharge_hours, discharge_soc, color='red', marker='v', s=60, zorder=5, label='放电时刻', edgecolors='white', linewidth=0.5)
+    ax.set_xlabel('时刻 (h)', fontsize=10)
+    ax.set_ylabel('SOC', fontsize=10)
+    ax.set_title(f'园区{park_id} 储能SOC变化曲线', fontsize=12, fontweight='bold')
+    ax.set_ylim(0, 1.0)
+    ax.legend(loc='lower right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+plt.suptitle('各园区储能荷电状态(SOC)变化曲线', fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+fig.savefig(os.path.join(FIGURES_DIR, "fig4_soc_curve.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图四已保存")
+
+# ============================================================
+# 图五：无储能与有储能方案对比
+# ============================================================
+print("[5/7] 生成图五：无储能与有储能方案对比...")
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for idx, (park_id, bl, stor) in enumerate(zip(["A", "B", "C"],
+    [baseline_A, baseline_B, baseline_C],
+    [storage_A, storage_B, storage_C])):
+    ax = axes[idx]
+    buy_no_stor = bl['buy_energy']
+    buy_stor = stor['buy_energy']
+    curtail_no_stor = bl['curtail_energy']
+    curtail_stor = stor['curtail_energy']
+    cost_no_stor = bl['total_cost']
+    cost_stor = stor['total_cost']
+
+    x = np.arange(3)
+    width = 0.35
+    ax.bar(x - width/2, [buy_no_stor, curtail_no_stor, cost_no_stor], width, label='无储能', color='#B07AA1', alpha=0.8)
+    ax.bar(x + width/2, [buy_stor, curtail_stor, cost_stor], width, label='有储能', color='#4E79A7', alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(['购电量', '弃电量', '用电成本(元)'])
+    ax.set_title(f'园区{park_id} 无储能vs有储能对比', fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+plt.suptitle('无储能与有储能运行指标对比', fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+fig.savefig(os.path.join(FIGURES_DIR, "fig5_baseline_vs_storage.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图五已保存")
+
+# ============================================================
+# 图六：储能容量优化结果
+# ============================================================
+print("[6/7] 生成图六：储能容量优化结果...")
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for idx, (park_id, scan_res) in enumerate(zip(["A", "B", "C"], [scan_A, scan_B, scan_C])):
+    ax = axes[idx]
+    if len(scan_res) > 0:
+        P_vals = [r['P'] for r in scan_res]
+        C_vals = [r['C'] for r in scan_res]
+        cost_vals = [r['annual_total'] for r in scan_res]
+        scatter = ax.scatter(P_vals, C_vals, c=cost_vals, cmap='viridis', s=50, alpha=0.6, edgecolors='w', linewidth=0.5)
+        ax.set_xlabel('储能功率 (kW)', fontsize=10)
+        ax.set_ylabel('储能容量 (kWh)', fontsize=10)
+        ax.set_title(f'园区{park_id} 储能容量优化', fontsize=12, fontweight='bold')
+        plt.colorbar(scatter, ax=ax, label='年化总成本(元)')
+    ax.grid(True, alpha=0.3)
+plt.suptitle('各园区储能容量优化结果', fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+fig.savefig(os.path.join(FIGURES_DIR, "fig6_capacity_optimization.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图六已保存")
+
+# ============================================================
+# 图七：独立运营 vs 联合运营经济性对比
+# ============================================================
+print("[7/7] 生成图七：独立运营 vs 联合运营经济性对比...")
+
+fig, ax = plt.subplots(figsize=(10, 6))
+categories = ['独立运营基线', '独立运营+储能', '联合运营+储能']
+costs = [joint['indep_bl_cost'], joint['indep_stor_cost'], joint['joint_stor_cost']]
+colors_bar = ['#B07AA1', '#4E79A7', '#59A14F']
+bars = ax.bar(categories, costs, color=colors_bar, width=0.5, alpha=0.8, edgecolor='white', linewidth=1.5)
+for bar, val in zip(bars, costs):
+    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 50,
+            f'{val:.2f}元', ha='center', va='bottom', fontsize=11, fontweight='bold')
+ax.set_ylabel('日用电成本 (元)', fontsize=11)
+ax.set_title('独立运营 vs 联合运营经济性对比', fontsize=13, fontweight='bold')
+ax.grid(True, alpha=0.3, axis='y')
+# 添加节省比例标注
+saving_text = f'联合运营相对独立运营节省 {joint["saving_rate"]:.1f}%'
+ax.text(0.5, 0.95, saving_text, transform=ax.transAxes, ha='center', va='top',
+        fontsize=11, fontweight='bold', color='#E15759',
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+plt.tight_layout()
+fig.savefig(os.path.join(FIGURES_DIR, "fig7_joint_operation.png"), dpi=150, bbox_inches='tight')
+plt.close()
+print("  图七已保存")
+
+print("\n所有7张图表生成完成!")
+print(f"图表保存在: {FIGURES_DIR}")
+for f in sorted(os.listdir(FIGURES_DIR)):
+    fpath = os.path.join(FIGURES_DIR, f)
+    print(f"  {f} ({os.path.getsize(fpath)} bytes)")
+
+# ============================================================
+# 表格生成部分 - 生成report中4张表格的图片
+# ============================================================
+print("\n" + "=" * 60)
+print("开始生成表格...")
+
+def draw_table(fig_width, headers, rows, filename, title=None):
+    """绘制表格图片"""
+    fig, ax = plt.subplots(figsize=(fig_width, max(0.6 * len(rows), 2)))
+    ax.axis('off')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    n_cols = len(headers)
+    n_rows = len(rows)
+
+    # 表格布局参数
+    margin_left = 0.05
+    margin_right = 0.95
+    margin_top = 0.95
+    margin_bottom = 0.05
+    col_w = (margin_right - margin_left) / n_cols
+    row_h = (margin_top - margin_bottom) / (n_rows + 1)  # +1 for header
+
+    # 颜色定义
+    header_color = '#2E5C8A'
+    text_color_white = 'white'
+    text_color_dark = '#333333'
+    alt_row_color = '#F2F7FC'
+    border_color = '#B0C4DE'
+
+    # 画表头
+    for j, h in enumerate(headers):
+        x = margin_left + j * col_w
+        y = margin_top - row_h
+        rect = plt.Rectangle((x, y), col_w, row_h, facecolor=header_color, edgecolor=border_color, linewidth=1)
+        ax.add_patch(rect)
+        ax.text(x + col_w / 2, y + row_h / 2, h, ha='center', va='center',
+                fontsize=10, fontweight='bold', color=text_color_white)
+
+    # 画数据行
+    for i, row in enumerate(rows):
+        y = margin_top - (i + 2) * row_h
+        bg_color = alt_row_color if i % 2 == 0 else 'white'
+        for j, val in enumerate(row):
+            x = margin_left + j * col_w
+            rect = plt.Rectangle((x, y), col_w, row_h, facecolor=bg_color, edgecolor=border_color, linewidth=1)
+            ax.add_patch(rect)
+            # 数字列右对齐，文字列居中
+            try:
+                float(val)
+                ha = 'right'
+                x_text = x + col_w * 0.9
+            except (ValueError, TypeError):
+                ha = 'center'
+                x_text = x + col_w / 2
+            ax.text(x_text, y + row_h / 2, str(val), ha=ha, va='center',
+                    fontsize=9.5, color=text_color_dark)
+
+    # 标题
+    if title:
+        ax.text(0.5, margin_top + 0.02, title, ha='center', va='bottom',
+                fontsize=12, fontweight='bold', color='#2E5C8A', transform=ax.transAxes)
+
+    fig.savefig(filename, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"  表格已保存: {os.path.basename(filename)}")
+
+# ---- 表1：各园区风光装机容量与负荷参数 ----
+print("\n[1/4] 生成表1：各园区风光装机容量与负荷参数...")
+headers1 = ['园区', '风电装机容量(kW)', '光伏装机容量(kW)', '最大负荷(kW)']
+rows1 = [
+    ['A', '\u2014', '750', '447'],
+    ['B', '1000', '\u2014', '419'],
+    ['C', '500', '600', '506'],
+]
+draw_table(8, headers1, rows1,
+           os.path.join(FIGURES_DIR, "table1_capacity_params.png"),
+           title='表1  各园区风光装机容量与负荷参数')
+
+# ---- 表2：无储能基线指标汇总 ----
+print("[2/4] 生成表2：无储能基线指标汇总...")
+headers2 = ['园区', '总负荷(kWh)', '总发电(kWh)', '购电量(kWh)', '弃电量(kWh)', '绿电自用比例', '日总成本(元)']
+rows2 = [
+    ['A', '7901.0', '3978.1', '4874.1', '951.2', '76.1%', '6084.88'],
+    ['B', '7710.0', '6175.2', '2432.3', '897.5', '85.5%', '5071.15'],
+    ['C', '7776.0', '6204.6', '2699.4', '1128.0', '81.8%', '4963.31'],
+]
+draw_table(12, headers2, rows2,
+           os.path.join(FIGURES_DIR, "table2_baseline_indicators.png"),
+           title='表2  无储能基线指标汇总')
+
+# ---- 表3：无储能基线单位电量平均供电成本 ----
+print("[3/4] 生成表3：无储能基线单位电量平均供电成本...")
+headers3 = ['园区', '总用电量(kWh)', '总供电成本(元)', '单位成本(元/kWh)']
+rows3 = [
+    ['A', '7901.0', '6084.88', '0.7701'],
+    ['B', '7710.0', '5071.15', '0.6577'],
+    ['C', '7776.0', '4963.31', '0.6383'],
+]
+draw_table(8, headers3, rows3,
+           os.path.join(FIGURES_DIR, "table3_unit_cost.png"),
+           title='表3  无储能基线单位电量平均供电成本')
+
+# ---- 表4：无储能与有储能方案对比 ----
+print("[4/4] 生成表4：无储能与有储能方案对比...")
+headers4 = ['园区', '方案', '购电量(kWh)', '弃电量(kWh)', '日总成本(元)', '成本降幅']
+rows4 = [
+    ['A', '无储能', '4874.1', '951.2', '6084.88', '\u2014'],
+    ['A', '有储能(50/100)', '4760.1', '867.0', '6004.56', '1.32%'],
+    ['B', '无储能', '2432.3', '897.5', '5071.15', '\u2014'],
+    ['B', '有储能(50/100)', '2237.2', '723.4', '4963.09', '2.13%'],
+    ['C', '无储能', '2699.4', '1128.0', '4963.31', '\u2014'],
+    ['C', '有储能(50/100)', '2540.3', '993.8', '4868.84', '1.90%'],
+]
+draw_table(10, headers4, rows4,
+           os.path.join(FIGURES_DIR, "table4_baseline_vs_storage.png"),
+           title='表4  无储能与有储能方案对比')
+
+print("\n所有4张表格生成完成!")
+print(f"表格保存在: {FIGURES_DIR}")
+for f in sorted(os.listdir(FIGURES_DIR)):
+    if f.startswith('table'):
+        fpath = os.path.join(FIGURES_DIR, f)
+        print(f"  {f} ({os.path.getsize(fpath)} bytes)")
+
+print("\n" + "=" * 60)
+print("全部图表和表格生成完毕!")
+print("=" * 60)
